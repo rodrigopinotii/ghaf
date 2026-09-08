@@ -104,8 +104,20 @@ let
   hostPersistentJournalPath = "/persist/var/log/journal";
   fssBasePath =
     if config.ghaf.type == "host" then "/persist/common/journal-fss" else "/etc/common/journal-fss";
+  # All FSS journalctl callers must use the SAME systemd as PID 1 / journald.
+  # journalctl --verify's integrity verdict depends on the journal-verify.c
+  # tag/epoch logic, and Ghaf vendors a patch to it
+  # (systemd-fss-verify-tolerate-repeated-epoch.patch, SSRCSP-8820). A verifier
+  # built from a different (unpatched) systemd would disagree with the sealing
+  # journald and report spurious "Epoch sequence not continuous" failures.
+  systemdPackage = config.systemd.package;
+
   fssTriagePackage =
-    pkgs.fss-triage or (pkgs.callPackage ../../../packages/pkgs-by-name/fss-triage/package.nix { });
+    (pkgs.fss-triage or (pkgs.callPackage ../../../packages/pkgs-by-name/fss-triage/package.nix { }))
+    .override
+      {
+        systemd = systemdPackage;
+      };
 
   preparePersistentJournalScript = pkgs.writeShellApplication {
     name = "journal-fss-prepare-persistent-journal";
@@ -120,14 +132,15 @@ let
   # Script to setup FSS keys on first boot
   setupScript = pkgs.writeShellApplication {
     name = "journal-fss-setup";
-    runtimeInputs = with pkgs; [
-      systemd
-      coreutils
-      gawk
-      findutils
-      gnugrep
-      util-linux
-    ];
+    runtimeInputs =
+      (with pkgs; [
+        coreutils
+        gawk
+        findutils
+        gnugrep
+        util-linux
+      ])
+      ++ [ systemdPackage ];
     # /etc/fss-verify-classifier.sh is populated at runtime (see environment.etc
     # below); shellcheck cannot follow it statically.
     excludeShellChecks = [ "SC1091" ];
@@ -1357,13 +1370,14 @@ let
   # Script to verify journal integrity
   verifyScript = pkgs.writeShellApplication {
     name = "journal-fss-verify";
-    runtimeInputs = with pkgs; [
-      systemd
-      coreutils
-      util-linux
-      gnugrep
-      gawk
-    ];
+    runtimeInputs =
+      (with pkgs; [
+        coreutils
+        util-linux
+        gnugrep
+        gawk
+      ])
+      ++ [ systemdPackage ];
     # /etc/fss-verify-classifier.sh is populated at runtime (see environment.etc
     # above); shellcheck cannot follow it statically.
     excludeShellChecks = [ "SC1091" ];

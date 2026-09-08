@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ghaf contributors <ghaf@tii.ae>
+Date: Mon, 8 Sep 2026 00:00:00 +0000
+Subject: [PATCH] journal: tolerate repeated same-epoch FSS tags in
+ --verify
+
+Vendored, pending upstream (Ghaf ticket SSRCSP-8820). Review with the FSS
+subsystem owner.
+
+`journal_file_verify()` with SEALED_CONTINUOUS only tolerates a single
+repeated tag epoch (the boundary repeat at tag #2). A forward wall-clock
+correction makes journald close/rotate/restart a sealed file several times
+inside one FSPRG interval -- each close writes a TAG at the same, not-yet-
+evolved epoch (`journal_file_append_tag()` stamps
+`FSPRG_GetEpoch(f->fsprg_state)` unconditionally). From the third such TAG
+onward `journalctl --verify` rejects the file permanently:
+
+    NNNNNN: Epoch sequence not continuous (E vs E)
+    File corruption detected at .../system@....journal:OFF ...
+    FAIL: .../system@....journal (Bad message)
+
+The equal operands are diagnostic: this is a repeat, never a rollback.
+
+Relax the check to tolerate any number of consecutive tags recording the
+same epoch. Every such TAG remains fully authenticated by checks that do
+not depend on epoch continuity:
+
+  * `o->tag.seqnum != n_tags + 1` -> fail: tag seqnums stay dense and
+    strictly forward, so no TAG can be dropped, replayed or reordered;
+  * the per-TAG HMAC is computed over that TAG's own contiguous,
+    non-overlapping `[last_tag, p]` byte range (the verify loop walks
+    offsets monotonically) under the FSPRG key for `o->tag.epoch`
+    (`journal_file_fsprg_seek()`); a forged TAG or any tampered byte in
+    its range -> "Tag failed verification";
+  * entry realtimes in the range must fall inside
+    `[fss_start + epoch*interval, +interval)` and no entry may predate the
+    previous tag ("Older entry after newer tag").
+
+The only property SEALED_CONTINUOUS adds over the non-continuous branch is
+refusing a forward gap (`epoch > last_epoch + 1`); that is kept. A
+backward epoch (`epoch < last_epoch`) still fails, so forward security is
+unchanged: a repeated-epoch TAG is sealed with the key already in use for
+that interval and grants an attacker nothing they could not already do
+with that key.
+
+`last_epoch` still only ever advances by 0 or +1, so the next real
+interval-boundary tag (`epoch == last_epoch + 1`) continues to pass.
+---
+ src/libsystemd/sd-journal/journal-verify.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/libsystemd/sd-journal/journal-verify.c b/src/libsystemd/sd-journal/journal-verify.c
+--- a/src/libsystemd/sd-journal/journal-verify.c
++++ b/src/libsystemd/sd-journal/journal-verify.c
+@@ -1135,8 +1135,19 @@
+                         }
+
+                         if (JOURNAL_HEADER_SEALED_CONTINUOUS(f->header)) {
+-                                if (!(n_tags == 0 || (n_tags == 1 && le64toh(o->tag.epoch) == last_epoch)
+-                                      || le64toh(o->tag.epoch) == last_epoch + 1)) {
++                                /* SSRCSP-8820: tolerate any number of consecutive tags that
++                                 * record the same epoch, not only a single boundary repeat.
++                                 * A forward wall-clock correction makes journald close/rotate
++                                 * a sealed file several times inside one FSPRG interval, each
++                                 * close writing a TAG at the same unevolved epoch. Every such
++                                 * TAG is still authenticated below: dense forward seqnum
++                                 * (checked above), a per-TAG HMAC over its own contiguous
++                                 * [last_tag, p] range under the epoch-correct FSPRG key, and
++                                 * entry realtimes confined to the epoch window. A backward
++                                 * epoch (epoch < last_epoch) and a forward gap
++                                 * (epoch > last_epoch + 1) both still fail. */
++                                if (!(n_tags == 0 || le64toh(o->tag.epoch) == last_epoch
++                                      || le64toh(o->tag.epoch) == last_epoch + 1)) {
+                                         error(p,
+                                               "Epoch sequence not continuous (%"PRIu64" vs %"PRIu64")",
+                                               le64toh(o->tag.epoch),
+--
+2.47.0
