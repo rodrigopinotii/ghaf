@@ -70,6 +70,7 @@ SPDX-License-Identifier = "LGPL-2.1-or-later"
 SPDX-FileCopyrightText = "systemd contributors"
 path = [
 	"modules/common/systemd/systemd-boot-double-dtb-buffer-size.patch",
+	"modules/common/systemd/systemd-fss-verify-tolerate-repeated-epoch.patch",
 	"modules/common/systemd/systemd-localed-locale-archive.patch",
 	"modules/common/systemd/systemd-re-enable-locale-setting.patch",
 ]

@@ -74,6 +74,12 @@ let
       (prevAttrs: {
         patches = prevAttrs.patches ++ [
           ./systemd-boot-double-dtb-buffer-size.patch
+          # Vendored, pending upstream (SSRCSP-8820): journalctl --verify tolerates
+          # any number of consecutive FSS TAGs recording the same FSPRG epoch, not
+          # just one boundary repeat. A forward wall-clock correction otherwise piles
+          # 3+ same-epoch TAGs into one interval and the file fails verification
+          # permanently. FSS sealing code -- review with the FSS subsystem owner.
+          ./systemd-fss-verify-tolerate-repeated-epoch.patch
         ];
       });
 

@@ -25,6 +25,18 @@
 let
   fssSetupTest = import ./test_scripts/fss_setup.nix;
   fssVerificationTest = import ./test_scripts/fss_verification.nix;
+
+  # journald carrying the vendored SSRCSP-8820 verify-side patch: journalctl
+  # --verify tolerates any number of consecutive FSS TAGs recording the same
+  # FSPRG epoch. The forward-clock-correction subtests below assert raw
+  # `journalctl --verify` is clean after a correction storm and still trips on
+  # tampered archives; without the patch the storm leaves an archive permanently
+  # failing "Epoch sequence not continuous".
+  patchedSystemd = pkgs.systemd.overrideAttrs (prev: {
+    patches = (prev.patches or [ ]) ++ [
+      ../../modules/common/systemd/systemd-fss-verify-tolerate-repeated-epoch.patch
+    ];
+  });
 in
 pkgs.testers.nixosTest {
   name = "logging-fss";
@@ -59,6 +71,8 @@ pkgs.testers.nixosTest {
       };
 
       config = {
+        systemd.package = patchedSystemd;
+
         # Enable FSS with short seal interval for testing
         ghaf.logging.enable = true;
         ghaf.logging.fss = {
@@ -82,14 +96,16 @@ pkgs.testers.nixosTest {
           "d /persist/common/journal-fss/test-host 0700 root root - -"
         ];
 
-        # Test utilities
+        # Test utilities. fss-test and fss-triage run `journalctl --verify`; they
+        # must use the same patched systemd as the node (SSRCSP-8820), matching
+        # what fss.nix now does with config.systemd.package.
         environment.systemPackages = with pkgs; [
           coreutils
           gnugrep
           util-linux
-          (callPackage ./test_scripts/fss-test.nix { })
+          (callPackage ./test_scripts/fss-test.nix { systemd = patchedSystemd; })
           (callPackage ./test_scripts/fss-classifier-cases.nix { })
-          (callPackage ../../packages/pkgs-by-name/fss-triage/package.nix { })
+          (callPackage ../../packages/pkgs-by-name/fss-triage/package.nix { systemd = patchedSystemd; })
         ];
       };
     };

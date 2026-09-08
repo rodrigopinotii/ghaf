@@ -64,6 +64,181 @@ _: ''
               raise Exception(f"Journal verification found critical failures: {output}")
           print(f"Journal verification completed (exit code: {exit_code})")
 
+  with subtest("Forward clock correction leaves sealed journals raw-verifiable (SSRCSP-8820 verify-side)"):
+      # journald carries the vendored verify-side patch: journalctl --verify
+      # tolerates any number of consecutive FSS TAGs recording the same FSPRG
+      # epoch. A forward wall-clock step + the activation-boundary churn (a
+      # journald restart, two rotations) otherwise piles 3+ TAGs into one
+      # interval and the archive fails "Epoch sequence not continuous (E vs E)"
+      # permanently. Bar = RAW journalctl --verify output: no FAIL lines and no
+      # corruption signature at all.
+      if not skip_if_setup_failed("verify-side raw-verify"):
+          vkey = machine.succeed(f"tr -d '[:space:]' < {verify_key_path}").strip()
+          machine.succeed("""
+            bash -lc '
+              set -euo pipefail
+              timedatectl set-ntp false 2>/dev/null || true
+              journalctl --rotate; journalctl --sync
+              date -s "@$(( $(date +%s) + 200 ))" >/dev/null
+              logger -t fss-test "vs 1"; logger -t fss-test "vs 2"; journalctl --sync
+              journalctl --rotate; journalctl --sync
+              journalctl --rotate; journalctl --sync
+              systemctl restart systemd-journald; sleep 1; journalctl --sync
+            '
+          """)
+          exit_code, output = machine.execute(
+              "journalctl --verify --verify-key=" + vkey + " 2>&1"
+          )
+          machine.succeed("timedatectl set-ntp true 2>/dev/null || true")
+          bad = [
+              ln
+              for ln in output.splitlines()
+              if ("FAIL:" in ln)
+              or ("Epoch sequence not continuous" in ln)
+              or ("Epoch sequence out of synchronization" in ln)
+              or ("Tag failed verification" in ln)
+              or ("Bad message" in ln)
+              or ("Hash value mismatch" in ln)
+              or ("references invalid" in ln)
+              or ("File corruption detected" in ln)
+              or ("Invalid object" in ln)
+          ]
+          if bad:
+              raise Exception(
+                  "raw journalctl --verify not clean after forward correction:\n"
+                  + "\n".join(bad)
+                  + "\n--- full ---\n"
+                  + output
+              )
+          print("verify-side: raw journalctl --verify clean after a forward correction")
+
+  with subtest("Verify still rejects tampered sealed archives (SSRCSP-8820 verify-side adversarial)"):
+      # The relaxation must not blind --verify to real tampering. Pick a genuine
+      # SEALED archive (compatible_flags bit0) whose tail object is a TAG
+      # (type byte 7) and which passes a clean --verify-key, then mutate copies of
+      # it with dd/truncate and assert --verify still rejects each. A
+      # journalctl --rotate on a sealed file writes a closing TAG
+      # (journal_file_write_final_tag), so a freshly rotated archive qualifies.
+      # Covers: epoch rollback (gate still fails or
+      # HMAC catches the wrong-epoch key), forged/zeroed tag seqnum (dense-forward
+      # seqnum check), bad tag HMAC, an entry/tag-region byte flip (per-tag HMAC),
+      # a broken tail-tag object header (structural), and truncation.
+      if not skip_if_setup_failed("verify-side adversarial"):
+          vkey = machine.succeed(f"tr -d '[:space:]' < {verify_key_path}").strip()
+          mid = machine.succeed("cat /etc/machine-id").strip()
+          machine.succeed(f"""
+            bash -lc '
+              set -euo pipefail
+              work=/root/fss-adversarial
+              rm -rf "$work"; mkdir -p "$work"
+              key={vkey}
+
+              archives() {{ ls -t /var/log/journal/{mid}/system@*.journal 2>/dev/null || true; }}
+              # journal Header: compatible_flags = LE u32 @ 8; bit0 = HEADER_COMPATIBLE_SEALED.
+              sealed_flag() {{ od -An -tu4 -j8 -N4 "$1" | tr -d " "; }}
+              # tail_object_offset = LE u64 @ 136; object type byte is the first byte of the object.
+              # OBJECT_TAG = 7 (UNUSED0 DATA1 FIELD2 ENTRY3 DATA_HT4 FIELD_HT5 ENTRY_ARRAY6 TAG7).
+              tail_off() {{ od -An -tu8 -j136 -N8 "$1" | tr -d " "; }}
+              type_at() {{ od -An -tu1 -j"$2" -N1 "$1" | tr -d " "; }}
+
+              pick_sealed_tag_archive() {{
+                local x fl t
+                for x in $(archives); do
+                  fl=$(sealed_flag "$x"); [ -n "$fl" ] || continue
+                  [ $(( fl & 1 )) -eq 1 ] || continue          # HEADER_COMPATIBLE_SEALED
+                  t=$(tail_off "$x"); [ -n "$t" ] && [ "$t" -gt 0 ] || continue
+                  [ "$(type_at "$x" "$t")" = 7 ] || continue    # tail object is OBJECT_TAG
+                  journalctl --file="$x" --verify --verify-key="$key" >"$work/probe.out" 2>&1 || continue
+                  printf "%s" "$x"; return 0
+                done
+                return 1
+              }}
+
+              timedatectl set-ntp false 2>/dev/null || true
+              src=""
+              for attempt in 1 2 3; do
+                for i in $(seq 1 60); do logger -t fss-adv "seed $attempt $i"; done
+                journalctl --sync; journalctl --rotate; journalctl --sync
+                src=$(pick_sealed_tag_archive || true)
+                [ -n "$src" ] && break
+              done
+              timedatectl set-ntp true 2>/dev/null || true
+              if [ -z "$src" ]; then
+                echo "ADVERSARIAL SETUP FAIL: no sealed archive with a TAG tail to tamper with" >&2
+                for x in $(archives); do
+                  echo "  $x sealed_flag=$(sealed_flag "$x") tail_off=$(tail_off "$x") tail_type=$(type_at "$x" "$(tail_off "$x")")" >&2
+                  journalctl --file="$x" --verify --verify-key="$key" 2>&1 | sed "s/^/    /" >&2 || true
+                done
+                exit 1
+              fi
+              echo "adversarial source: $src ($(stat -c %s "$src") bytes)"
+              toff=$(tail_off "$src")
+
+              expect_reject() {{
+                # exit 0 from --verify = PASSED (bad for us); non-zero = rejected (good)
+                local f="$1" label="$2"
+                if journalctl --file="$f" --verify --verify-key="$key" >"$f.out" 2>&1; then
+                  echo "ADVERSARIAL FAIL [$label]: journalctl --verify accepted a tampered archive" >&2
+                  cat "$f.out" >&2
+                  exit 1
+                fi
+                if ! grep -qE "FAIL:|Bad message|Epoch sequence|Tag failed verification|Hash value mismatch|Invalid object|File corruption|corrupt|truncated|invalid|Failed to open|No data available|references (invalid|a bad)" "$f.out"; then
+                  echo "ADVERSARIAL FAIL [$label]: rejected but with no corruption signature" >&2
+                  cat "$f.out" >&2
+                  exit 1
+                fi
+                echo "adversarial ok [$label]: $(grep -m1 -oE \"FAIL:.*|Bad message|Epoch sequence[^\\)]*\\)|Tag failed verification|Hash value mismatch\" \"$f.out\" || true)"
+              }}
+
+              # (1) epoch rollback: zero the tail TAG epoch field (toff+24, 8B).
+              #     If a prior tag exists, 0 < last_epoch -> the gate still rejects
+              #     ("Epoch sequence not continuous (0 vs N)"). If the tail is the
+              #     only tag, fsprg_seek(0) loads the wrong key -> HMAC rejects.
+              #     Skip only in the degenerate case where the tail epoch is
+              #     already 0 (zeroing would be a no-op).
+              cur_epoch=$(od -An -tu8 -j$((toff + 24)) -N8 "$src" | tr -d " ")
+              if [ -n "$cur_epoch" ] && [ "$cur_epoch" -gt 0 ]; then
+                f="$work/rollback.journal"; cp "$src" "$f"
+                dd if=/dev/zero of="$f" bs=1 seek=$((toff + 24)) count=8 conv=notrunc status=none
+                expect_reject "$f" "epoch-rollback"
+              else
+                echo "adversarial skip [epoch-rollback]: tail tag epoch already 0"
+              fi
+
+              # (2) zeroed/forged tag seqnum: tail TAG seqnum field (toff+16, 8B) -> != n_tags+1
+              f="$work/seqnum.journal"; cp "$src" "$f"
+              dd if=/dev/zero of="$f" bs=1 seek=$((toff + 16)) count=8 conv=notrunc status=none
+              expect_reject "$f" "tag-seqnum"
+
+              # (3) bad HMAC: randomize 8 bytes of the tail TAG hmac (toff+32 .. toff+64)
+              f="$work/hmac.journal"; cp "$src" "$f"
+              dd if=/dev/urandom of="$f" bs=1 seek=$((toff + 40)) count=8 conv=notrunc status=none
+              expect_reject "$f" "tag-hmac-flip"
+
+              # (4) sealed-region flip: randomize 24 bytes ending at the tail TAG header
+              #     (the object right before it, HMAC-covered)
+              f="$work/regionflip.journal"; cp "$src" "$f"
+              off=$(( toff > 24 ? toff - 24 : 0 ))
+              dd if=/dev/urandom of="$f" bs=1 seek=$off count=24 conv=notrunc status=none
+              expect_reject "$f" "sealed-region-flip"
+
+              # (5) broken tail-tag object header: zero its whole ObjectHeader (type + size,
+              #     16B at toff) -> structural reject (bad object / tag count mismatch)
+              f="$work/badhdr.journal"; cp "$src" "$f"
+              dd if=/dev/zero of="$f" bs=1 seek=$toff count=16 conv=notrunc status=none
+              expect_reject "$f" "tail-tag-bad-header"
+
+              # (6) truncation: chop 40B off the end -> the tail TAG object claims a size
+              #     that overruns EOF (file still opens; the object walk / open fails)
+              f="$work/truncated.journal"; cp "$src" "$f"
+              truncate -s -40 "$f"
+              expect_reject "$f" "truncation"
+
+              rm -rf "$work"
+              echo "verify-side: all adversarial tamper cases still rejected"
+            '
+          """)
+
   with subtest("Classifier + policy cover all failure branches"):
       # The case table lives in tests/logging/test_scripts/fss-classifier-cases.nix
       # so the same assertions also run VM-free as
