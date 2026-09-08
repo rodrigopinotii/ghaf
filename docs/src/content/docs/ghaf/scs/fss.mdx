@@ -195,6 +195,24 @@ journalctl -o export > journal.export
 journalctl --verify --verify-key=<verification-key> --file=journal.export
 ```
 
+:::caution[Use Ghaf's `journalctl` for off-device verification]
+Ghaf ships a vendored systemd patch
+(`systemd-fss-verify-tolerate-repeated-epoch.patch`, SSRCSP-8820) that makes
+`journalctl --verify` tolerate more than one FSS TAG per FSPRG interval. Journald
+legitimately writes several same-epoch TAGs when a sealed journal is
+rotated/restarted repeatedly inside one `sealInterval` (the FSS-activation
+sequence does this on every boot). **Stock upstream `journalctl` rejects such an
+archive with `Epoch sequence not continuous (N vs N)` even though it is
+untampered**, and aborts the rest of that file's verification.
+
+Until the patch is upstream, an external auditor verifying an exported archive
+must run Ghaf's `journalctl` (or apply the same patch). A `FAIL` with
+`Epoch sequence not continuous` and *equal* operands, from a stock `journalctl`,
+is this known divergence, not evidence of tampering — re-verify with the patched
+binary. A rollback prints *unequal* operands `(M vs N)`, `M < N`, and fails under
+both.
+:::
+
 ## Troubleshooting
 
 ### Verification Fails with "FAIL"
