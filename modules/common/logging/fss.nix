@@ -2137,7 +2137,23 @@ in
               Type = "oneshot";
               RemainAfterExit = true;
               ExecStart = "${pkgs.coreutils}/bin/true";
-              ExecStop = getExe sealRotateScript;
+              ExecStop = [
+                (getExe sealRotateScript)
+                # Guest-side mirror of the host-half (SFO 29f5910, which does this
+                # on ghaf-host): once the journals are sealed + archived, stop
+                # journald's listener sockets so PID 1's remaining shutdown lines
+                # cannot socket-reactivate journald into a fresh STATE_ONLINE
+                # system.journal -- which the next boot KEEP+APPEND-reopens with a
+                # straddling closing tag (seen fleet-wide on ~1 in 12 corrections,
+                # classifier-absorbed but a visible raw "Bad message"). Processless
+                # socket units stop instantly: this is NOT the
+                # `systemctl stop systemd-journald.service` deadlock (that unit is
+                # ordered after this one and blocks on its own TimeoutStopSec).
+                # `-` prefix: ignore units that are absent or masked on this guest.
+                # Remaining shutdown transcript still reaches the next boot via kmsg
+                # (ReadKMsg=yes, stock).
+                "-${systemdPackage}/bin/systemctl stop systemd-journald.socket systemd-journald-dev-log.socket systemd-journald-audit.socket systemd-journald-varlink@.socket syslog.socket"
+              ];
               # Bounded well under the microVM stop timeout (crosvm, ~30s).
               TimeoutStopSec = "25s";
             };
