@@ -1557,25 +1557,28 @@ let
     '';
   };
 
-  # Seal + archive the FSS journals early in shutdown. Runs as the ExecStop of a
-  # oneshot ordered After=systemd-journald.service, so on shutdown it fires
-  # *before* journald's own stop, while journald is still up to service the
-  # request. Without it, a microVM teardown (crosvm powerbtn, TimeoutSec=30s)
-  # force-kills the guest before journald's journal_file_offline_close
-  # (write_final_tag + journal_file_archive) finishes on a large actively-written
-  # journal; the next boot then KEEP+APPEND-reopens the un-finalised sealed file,
-  # producing the reopen tag-coverage gap and the reopen forward-epoch gap on
-  # user journals (SSRCSP-8820 "Bug-3"/"Bug-4").
+  # Seal + archive every open FSS journal while journald is still running, so a
+  # microVM teardown (crosvm powerbtn, TimeoutSec ~30s) cannot force-kill the
+  # guest before journald's journal_file_offline_close (write_final_tag +
+  # journal_file_archive) finishes and leave a sealed file STATE_ONLINE. The
+  # next boot would KEEP+APPEND-reopen such a file, and the closing tag it then
+  # writes straddles the FSPRG epoch the clock step evolved to -- the reopen
+  # tag-coverage gap / forward-epoch gap (SSRCSP-8820 "Bug-3"/"Bug-4").
   #
   # Uses `journalctl --rotate`, NOT `systemctl stop systemd-journald`: --rotate
   # is a client request to the running journald (journal_file_rotate ->
   # write_final_tag + journal_file_archive, then a fresh file), so it seals the
-  # accumulated journals without stopping journald. Stopping journald here would
-  # deadlock -- journald's own stop job is ordered after this unit in the same
-  # shutdown transaction, so a synchronous `systemctl stop` blocks until its own
+  # accumulated journals without stopping journald. Stopping journald from the
+  # shutdown transaction deadlocks -- journald's own stop job is ordered after
+  # the finalize unit, so a synchronous `systemctl stop` blocks until its own
   # TimeoutStopSec and then journald is force-terminated mid-finalise.
-  shutdownFinalizeScript = pkgs.writeShellApplication {
-    name = "journal-fss-shutdown-finalize";
+  #
+  # Driven from two places: the ExecStop of journal-fss-shutdown-finalize (every
+  # shutdown/reboot) and the OnClockChange-triggered journal-fss-clockstep-rotate
+  # (the moment a wall-clock step is seen, before the ~45s-later reboot), so the
+  # pre-step content is archived early and the STATE_ONLINE window is small.
+  sealRotateScript = pkgs.writeShellApplication {
+    name = "journal-fss-seal-rotate";
     runtimeInputs = [ systemdPackage ];
     text = ''
       journalctl --sync 2>/dev/null || true
@@ -2104,7 +2107,7 @@ in
 
           # Finalise (seal + archive) the FSS journals early in shutdown, before
           # the microVM teardown can force-kill journald mid-offline-close. See
-          # shutdownFinalizeScript above.
+          # sealRotateScript above.
           journal-fss-shutdown-finalize = {
             description = "Seal and archive FSS journals before shutdown";
             documentation = [ "man:journalctl(1)" ];
@@ -2116,8 +2119,16 @@ in
               "systemd-journald.service"
               "journal-fss-setup.service"
             ];
+            # DefaultDependencies=false keeps this unit out of the normal
+            # multi-user.target stop wave, so it stays alive until the late
+            # shutdown.target conflict and its ExecStop rotates when few other
+            # services are still writing logs. The explicit conflict + ordering
+            # are what then run (and bound) the ExecStop on shutdown.
+            before = [ "shutdown.target" ];
+            conflicts = [ "shutdown.target" ];
 
             unitConfig = {
+              DefaultDependencies = false;
               # Only meaningful once FSS keys exist (skips the host, which has none).
               ConditionPathExists = "${cfg.keyPath}/initialized";
             };
@@ -2126,9 +2137,28 @@ in
               Type = "oneshot";
               RemainAfterExit = true;
               ExecStart = "${pkgs.coreutils}/bin/true";
-              ExecStop = getExe shutdownFinalizeScript;
+              ExecStop = getExe sealRotateScript;
               # Bounded well under the microVM stop timeout (crosvm, ~30s).
               TimeoutStopSec = "25s";
+            };
+          };
+
+          # Seal + archive the moment a wall-clock step is observed -- before the
+          # operator flow's ~45s-later reboot -- so the pre-step content is
+          # archived by the journald that wrote it and the STATE_ONLINE window
+          # the reboot can catch is small. Redundant with journald's own
+          # "Time jumped, rotating", harmless, and cheap.
+          journal-fss-clockstep-rotate = {
+            description = "Seal and archive FSS journals on a wall-clock step";
+            documentation = [ "man:journalctl(1)" ];
+            after = [
+              "systemd-journald.service"
+              "journal-fss-setup.service"
+            ];
+            unitConfig.ConditionPathExists = "${cfg.keyPath}/initialized";
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStart = getExe sealRotateScript;
             };
           };
         };
@@ -2147,6 +2177,17 @@ in
           }
           // optionalAttrs cfg.verifyOnBoot {
             OnBootSec = "10min";
+          };
+        };
+
+        # Fire journal-fss-clockstep-rotate whenever the wall clock is stepped.
+        timers.journal-fss-clockstep-rotate = {
+          description = "Seal FSS journals when the wall clock is stepped";
+          documentation = [ "man:journalctl(1)" ];
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnClockChange = true;
+            Unit = "journal-fss-clockstep-rotate.service";
           };
         };
       };
