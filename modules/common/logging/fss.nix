@@ -2139,20 +2139,28 @@ in
               ExecStart = "${pkgs.coreutils}/bin/true";
               ExecStop = [
                 (getExe sealRotateScript)
-                # Guest-side mirror of the host-half (SFO 29f5910, which does this
-                # on ghaf-host): once the journals are sealed + archived, stop
-                # journald's listener sockets so PID 1's remaining shutdown lines
-                # cannot socket-reactivate journald into a fresh STATE_ONLINE
-                # system.journal -- which the next boot KEEP+APPEND-reopens with a
-                # straddling closing tag (seen fleet-wide on ~1 in 12 corrections,
-                # classifier-absorbed but a visible raw "Bad message"). Processless
-                # socket units stop instantly: this is NOT the
-                # `systemctl stop systemd-journald.service` deadlock (that unit is
-                # ordered after this one and blocks on its own TimeoutStopSec).
-                # `-` prefix: ignore units that are absent or masked on this guest.
-                # Remaining shutdown transcript still reaches the next boot via kmsg
-                # (ReadKMsg=yes, stock).
-                "-${systemdPackage}/bin/systemctl stop systemd-journald.socket systemd-journald-dev-log.socket systemd-journald-audit.socket systemd-journald-varlink@.socket syslog.socket"
+                # Guest-side mirror of the host-half (SFO 29f5910): once the
+                # journals are sealed + archived, stop journald's listener sockets
+                # so PID 1's remaining shutdown lines cannot socket-reactivate
+                # journald into a fresh STATE_ONLINE system.journal -- which the
+                # next boot KEEP+APPEND-reopens with a straddling closing tag.
+                #
+                # --no-block: enqueue the stop jobs and return immediately, do NOT
+                # wait. This unit is ordered `After=systemd-journald.service`, so
+                # journald's own stop job is sequenced after this unit -- a
+                # blocking `systemctl stop` here would wait on a stop job that is
+                # itself waiting on this ExecStop to finish, deadlock until the 25s
+                # timeout, then SIGKILL before the sockets are down (the c7428c53
+                # gate failure). With --no-block the jobs run in the shutdown
+                # transaction after this unit stops; nothing re-activates journald
+                # once its sockets and service are both stopped, and the remaining
+                # transcript still reaches the next boot via kmsg (ReadKMsg=yes).
+                #
+                # Only the two always-present listeners: -audit is masked when
+                # audit is off, -varlink@ is a template (bare `stop` errors), and
+                # syslog.socket is an alias -- 29f5910 stops just these two too.
+                # `-` prefix keeps a stray failure from failing the ExecStop.
+                "-${systemdPackage}/bin/systemctl stop --no-block systemd-journald.socket systemd-journald-dev-log.socket"
               ];
               # Bounded well under the microVM stop timeout (crosvm, ~30s).
               TimeoutStopSec = "25s";
