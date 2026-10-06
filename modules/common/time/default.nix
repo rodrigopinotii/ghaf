@@ -261,6 +261,46 @@ in
             makestep 1.0 -1
           '';
         };
+
+        # nixpkgs' NM hook runs onoffline once and DNS can lag "up"; chronyd then backs off to ~1h.
+        systemd.services.ghaf-chrony-onoffline = {
+          description = "Tell chronyd the network configuration changed";
+          after = [ "chronyd.service" ];
+          requisite = [ "chronyd.service" ];
+          unitConfig.StartLimitIntervalSec = 0;
+          serviceConfig = {
+            Type = "oneshot";
+            # Back-to-back NM events restart a run mid-sleep; that is not a failure.
+            SuccessExitStatus = "SIGTERM";
+          };
+          path = [
+            config.services.chrony.package
+            pkgs.gawk
+          ];
+          # Each failed resolve re-arms chronyd's backoff.
+          script = ''
+            for _ in $(seq 12); do
+              chronyc onoffline >/dev/null 2>&1 || true
+              online=$(chronyc activity 2>/dev/null | awk '/sources online|return to online/ {n += $1} END {print n + 0}')
+              [ "$online" -gt 0 ] && exit 0
+              sleep 5
+            done
+            echo "no upstream source online after 60s" >&2
+          '';
+        };
+
+        networking.networkmanager.dispatcherScripts = mkIf config.networking.networkmanager.enable [
+          {
+            type = "basic";
+            source = pkgs.writeShellScript "ghaf-chrony-dispatcher" ''
+              case "$2" in
+                up | down | connectivity-change | dhcp4-change | dhcp6-change)
+                  ${pkgs.systemd}/bin/systemctl restart --no-block ghaf-chrony-onoffline.service
+                  ;;
+              esac
+            '';
+          }
+        ];
       })
     ]
   );
